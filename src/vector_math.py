@@ -42,6 +42,10 @@ class Vector:
         # Handles reverse multiplication (eg. 2 * Vector) by deferring to `__mul__`
         return self.__mul__(scalar)
 
+    def __neg__(self) -> "Vector":
+        """Allows prefixing a vector with a negative sign. Needed for advanced lighting"""
+        return Vector(-self.x, -self.y, -self.z)
+
     def magnitude(self) -> float:
         return math.sqrt(self.x**2 + self.y**2 + self.z**2)
 
@@ -64,4 +68,19 @@ class Vector:
             self.x * other.x
             + self.y * other.y
             + self.z * other.z
+        )
+
+    def cross(self, other: "Vector") -> "Vector":
+        """
+        Computes the mathematical Cross Product (self x other).
+        Essential for building localized coordinate spaces, camera orientations,
+        and area light orientation matrices.
+        """
+        if not isinstance(other, Vector):
+            return NotImplemented
+
+        return Vector(
+            x=(self.y * other.z) - (self.z * other.y),
+            y=(self.z * other.x) - (self.x * other.z),
+            z=(self.x * other.y) - (self.y * other.x)
         )
