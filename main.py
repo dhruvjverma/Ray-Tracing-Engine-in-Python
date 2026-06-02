@@ -1,4 +1,7 @@
+import time
+import cupy as cp
 import numpy as np
+
 from PIL import Image
 from src.geometry import Sphere, Material, Plane
 from src.renderer_3d import Renderer3D
@@ -6,39 +9,59 @@ from src.renderer_3d import Renderer3D
 def main():
     WIDTH = 800
     HEIGHT = 600
-    BACKGROUND_COLOR = (25, 25, 35)
+    BACKGROUND_COLOR = (30, 32, 40)  
 
-    print(f"Initializing batch NumPy execution context at {WIDTH}x{HEIGHT}...")
+    print(f"Initializing CuPy context for RTX 4070 at {WIDTH}x{HEIGHT}...")
     renderer = Renderer3D(width=WIDTH, height=HEIGHT, background_color=BACKGROUND_COLOR)
 
     camera_origin = (0.0, 0.0, -1.0)
-    light_position = (-3.0, 4.0, 1.0)
     field_of_view = 65.0
 
-    matte_clay = Material(diffuse=1.0, specular=0.0, shininess=1)
-    glossy_plastic = Material(diffuse=0.7, specular=0.4, shininess=32)
-    polished_metallic = Material(diffuse=0.2, specular=0.8, shininess=128)
-    floor_mat = Material(diffuse=0.8, specular=0.1, shininess=10)
+    matte_clay_red = Material(diffuse=0.95, specular=0.0, shininess=1, reflectivity=0.0)
+    glossy_plastic_green = Material(diffuse=0.85, specular=0.4, shininess=32, reflectivity=0.15)
+    polished_mirror_blue = Material(diffuse=0.2, specular=0.9, shininess=128, reflectivity=0.8)
+    floor_mat = Material(diffuse=0.9, specular=0.2, shininess=16, reflectivity=0.25)
+    overhead_light_mat = Material(diffuse=0.0, specular=0.0, shininess=1, reflectivity=0.0, emission=cp.array([1.0, 1.0, 1.0], dtype=cp.float32))
 
-    # Injecting optimized NumPy tracking vectors cleanly across the scene graph
     scene = [
-        Sphere(center=np.array([-2.2, 0.0, 4.5], dtype=np.float64), radius=0.9, color=(255, 65, 65), material=matte_clay),
-        Sphere(center=np.array([0.0, 0.0, 4.5], dtype=np.float64), radius=0.9, color=(65, 225, 65), material=glossy_plastic),
-        Sphere(center=np.array([2.2, 0.0, 4.5], dtype=np.float64), radius=0.9, color=(65, 105, 255), material=polished_metallic),
-        Plane(point=np.array([0.0, -0.9, 0.0], dtype=np.float64), normal=np.array([0.0, 1.0, 0.0], dtype=np.float64), color=(180, 180, 180), material=floor_mat)
+        Sphere(center=cp.array([0.0, 4.0, 3.8], dtype=cp.float32), radius=1.2, color=(255, 255, 255), material=overhead_light_mat),
+        Sphere(center=cp.array([-2.2, 0.0, 4.5], dtype=cp.float32), radius=0.9, color=(255, 45, 45), material=matte_clay_red),
+        Sphere(center=cp.array([0.0, 0.0, 4.5], dtype=cp.float32), radius=0.9, color=(45, 225, 45), material=glossy_plastic_green),
+        Sphere(center=cp.array([2.2, 0.0, 4.5], dtype=cp.float32), radius=0.9, color=(45, 95, 255), material=polished_mirror_blue),
+        Plane(point=cp.array([0.0, -0.9, 0.0], dtype=cp.float32), normal=cp.array([0.0, 1.0, 0.0], dtype=cp.float32), color=(200, 200, 200), material=floor_mat)
     ]
 
-    print("Running loopless-per-pixel scene trace matrix operations...")
-    image_matrix = renderer.render_3d_scene(camera_origin, field_of_view, scene, light_position)
-    print("Matrix parsing complete. Writing flat pixel stream to image...")
+    MAX_BOUNCE_DEPTH = 4    
+    AA_SAMPLES = 2          # 2x AA turns into a 4x SSAA Grid filter
+    SAMPLES_PER_PIXEL = 512 
 
-    # Flatten buffer array and convert directly into standard output canvases
-    flat_pixel_buffer = [tuple(pixel) for row in image_matrix for pixel in row]
+    print("-" * 64)
+    print("Executing Vectorized GPU Engine Pipeline (CuPy Backend):")
+    print(" - Rendering Style:  Unbiased Monte Carlo Path Tracer")
+    print(f" - Anti-Aliasing:   {AA_SAMPLES * AA_SAMPLES}x SSAA Grid Filtering")
+    print(f" - Total Ray Paths:  {SAMPLES_PER_PIXEL} SPP (Random Jittered)")
+    print(f" - Trace Bounce Limit: {MAX_BOUNCE_DEPTH} Recursive Depth")
+    print("-" * 64)
 
-    img = Image.new("RGB", (WIDTH, HEIGHT))
-    img.putdata(flat_pixel_buffer)
+    start_time = time.perf_counter()
+
+    image_matrix = renderer.render_3d_scene(
+        camera_origin_tuple=camera_origin, 
+        fov_degrees=field_of_view, 
+        scene=scene, 
+        max_depth=MAX_BOUNCE_DEPTH,
+        aa_samples=AA_SAMPLES,
+        spp=SAMPLES_PER_PIXEL
+    )
+    
+    elapsed_seconds = time.perf_counter() - start_time
+    
+    print("\nSaving host image array matrix...")
+    img = Image.fromarray(image_matrix, mode="RGB")
     img.save("render_output.png")
-    print("Success! Created vectorized 'render_output.png'.")
+    
+    print(f"⏱️ Total Time Taken: {int(elapsed_seconds // 60)}m {elapsed_seconds % 60:.2f}s")
+    print("Success! Created 'render_output.png' via GPU acceleration.")
 
 if __name__ == "__main__":
     main()

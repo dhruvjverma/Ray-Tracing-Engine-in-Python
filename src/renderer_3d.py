@@ -1,229 +1,249 @@
 import math
+import time
+import cupy as cp
 import numpy as np
+
 from typing import List, Tuple
-from src.geometry import Intersectable, Ray
+from dataclasses import dataclass
+from src.geometry import Intersectable, Sphere, Plane
 
+def srgb_to_linear(srgb_array: cp.ndarray) -> cp.ndarray:
+    """Converts sRGB [0,1] to linear light using CUDA-accelerated element-wise ops."""
+    return cp.where(srgb_array <= 0.04045,
+                    srgb_array / 12.92,
+                    ((srgb_array + 0.055) / 1.055) ** 2.4)
 
-def _to_linear_batch(colors: np.ndarray) -> np.ndarray:
-    """Converts a whole image block from sRGB space to linear space."""
-    return ((colors / 255.0) ** 2.2) * 255.0
-
+@dataclass
+class SceneBuffers:
+    """Linearized Struct-of-Arrays scene representation fully pinned on the GPU."""
+    is_sphere: cp.ndarray
+    centers: cp.ndarray
+    radii_sq: cp.ndarray
+    plane_normals: cp.ndarray
+    colors_linear: cp.ndarray
+    diffuse: cp.ndarray
+    reflectivity: cp.ndarray
+    emission: cp.ndarray
+    is_emissive: cp.ndarray
 
 class Renderer3D:
-    def __init__(
-        self,
-        width: int,
-        height: int,
-        background_color: Tuple[int, int, int],
-    ) -> None:
+    def __init__(self, width: int, height: int, background_color: Tuple[int, int, int]) -> None:
         self.width = width
         self.height = height
-        self.background_color = background_color
+        self.MAX_DIST = 1e30 
+        
+        # Initialize background color directly as a GPU tensor
+        bg_cpu = np.array(background_color, dtype=np.float32) / 255.0
+        self.background_linear = srgb_to_linear(cp.asarray(bg_cpu))
+        
+        # CuPy Random Generator handles multi-threaded CUDA-native parallel RNG generation
+        self.rng = cp.random.default_rng(seed=42)
+
+    def _build_scene_buffers(self, scene: List[Intersectable]) -> SceneBuffers:
+        """Flattens Python geometry objects directly into unified CuPy GPU allocations."""
+        N = len(scene)
+        buf = SceneBuffers(
+            is_sphere=cp.zeros(N, dtype=bool),
+            centers=cp.zeros((N, 3), dtype=cp.float32),
+            radii_sq=cp.zeros(N, dtype=cp.float32),
+            plane_normals=cp.zeros((N, 3), dtype=cp.float32),
+            colors_linear=cp.zeros((N, 3), dtype=cp.float32),
+            diffuse=cp.zeros(N, dtype=cp.float32),
+            reflectivity=cp.zeros(N, dtype=cp.float32),
+            emission=cp.zeros((N, 3), dtype=cp.float32),
+            is_emissive=cp.zeros(N, dtype=bool)
+        )
+        
+        for i, obj in enumerate(scene):
+            color_gpu = cp.asarray(np.array(obj.color, dtype=np.float32) / 255.0)
+            buf.colors_linear[i] = srgb_to_linear(color_gpu)
+            buf.diffuse[i] = obj.material.diffuse
+            buf.reflectivity[i] = obj.material.reflectivity
+            buf.emission[i] = cp.asarray(obj.material.emission)
+            buf.is_emissive[i] = obj.material.is_emissive
+
+            if isinstance(obj, Sphere):
+                buf.is_sphere[i] = True
+                buf.centers[i] = cp.asarray(obj.center)
+                buf.radii_sq[i] = obj.radius ** 2
+            elif isinstance(obj, Plane):
+                buf.is_sphere[i] = False
+                buf.centers[i] = cp.asarray(obj.point)
+                buf.plane_normals[i] = cp.asarray(obj.normal)
+                
+        return buf
 
     def render_3d_scene(
         self,
         camera_origin_tuple: Tuple[float, float, float],
         fov_degrees: float,
         scene: List[Intersectable],
-        light_position_tuple: Tuple[float, float, float],
-    ) -> List[List[Tuple[int, int, int]]]:
-        """Entry method coordinating the vectorized multi-stage data pipelines."""
-        camera_origin = np.array(camera_origin_tuple, dtype=np.float64)
-        light_position = np.array(light_position_tuple, dtype=np.float64)
-
-        # Helper 1: Setup global grid coordinates and ray directions
-        ray_origins, ray_directions = self._build_primary_rays(camera_origin, fov_degrees)
-
-        # Helper 2: Handle ray intersections across every primitive object in the scene
-        closest_obj_indices, closest_distances, hit_mask = self._intersect_scene(
-            ray_origins, ray_directions, scene
-        )
-
-        # Create output channels filled with the default background color configuration
-        out_channels = np.zeros((self.height, self.width, 3), dtype=np.float64)
-        out_channels[:, :] = self.background_color
-
-        # Short-circuit if nothing is intersected by the view frustum
-        if not np.any(hit_mask):
-            return out_channels.astype(np.uint8).tolist()
-
-        # Isolate and extract exact geometric world space coordinate hit locations
-        hit_points = ray_origins + ray_directions * closest_distances[..., np.newaxis]
-
-        # Helper 3: Pull surface normals polymorphically using masked blocks
-        normals = self._compute_normals(hit_points, closest_obj_indices, hit_mask, scene)
-
-        # Helper 4: Evaluate shadow visibility using a complete secondary intersection loop
-        shadow_mask = self._compute_shadows(hit_points, normals, hit_mask, light_position, scene)
-
-        # Helper 5: Perform Phong illumination shading, clamp intensities, and run gamma correction
-        lit_colors = self._shade(
-            hit_points, ray_directions, normals, shadow_mask, hit_mask, closest_obj_indices, light_position, scene
-        )
-
-        # Splice the processed lighting pixel data back on top of the default background canvas layers
-        out_channels[hit_mask] = lit_colors[hit_mask]
-
-        # Cast to standard output structure array matrices safely
-        return out_channels.astype(np.uint8).tolist()
-
-    def _build_primary_rays(self, camera_origin: np.ndarray, fov_degrees: float) -> Tuple[np.ndarray, np.ndarray]:
-        """Generates coordinate meshes for screen pixels instantly using np.meshgrid."""
-        aspect_ratio = self.width / self.height
-        scale = math.tan(math.radians(fov_degrees) / 2.0)
-
-        cols = np.arange(self.width, dtype=np.float64)
-        rows = np.arange(self.height, dtype=np.float64)
-
-        col_grid, row_grid = np.meshgrid(cols, rows)
-
-        norm_x = 0.0 if self.width == 1 else -1.0 + (col_grid / (self.width - 1)) * 2.0
-        norm_y = 0.0 if self.height == 1 else 1.0 - (row_grid / (self.height - 1)) * 2.0
-
-        # Construct direction tensors
-        dirs = np.stack([norm_x * scale * aspect_ratio, norm_y * scale, np.ones_like(norm_x)], axis=-1)
-        magnitudes = np.linalg.norm(dirs, axis=-1, keepdims=True)
-        ray_directions = dirs / magnitudes
-
-        # Broadcast static origin out to match full array matrix spatial properties
-        ray_origins = np.broadcast_to(camera_origin, ray_directions.shape)
-
-        return ray_origins, ray_directions
-
-    def _intersect_scene(
-        self, ray_origins: np.ndarray, ray_directions: np.ndarray, scene: List[Intersectable]
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Builds a 3D distance buffer and gathers closest intersection data across objects."""
-        # Create a distance tracking layer stacked along axis 0: Shape (num_objects, H, W)
-        all_distances = np.stack([obj.intersect_batch(ray_origins, ray_directions) for obj in scene], axis=0)
-
-        closest_obj_indices = np.argmin(all_distances, axis=0)
-        closest_distances = np.min(all_distances, axis=0)
-
-        # Background pixels reside where even the absolute minimum closest distance reads as infinite
-        hit_mask = closest_distances < np.inf
-
-        return closest_obj_indices, closest_distances, hit_mask
-
-    def _compute_normals(
-        self, hit_points: np.ndarray, closest_obj_indices: np.ndarray, hit_mask: np.ndarray, scene: List[Intersectable]
+        max_depth: int = 4,
+        aa_samples: int = 1,
+        spp: int = 128,
     ) -> np.ndarray:
-        """Extracts localized normals polymorphically using target object masks."""
-        normals = np.zeros_like(hit_points)
+        
+        camera_origin = cp.asarray(np.array(camera_origin_tuple, dtype=np.float32))
+        ss_width, ss_height = self.width * aa_samples, self.height * aa_samples
+        
+        # Unified tracking allocations on VRAM
+        total_accumulated_color = cp.zeros((ss_height, ss_width, 3), dtype=cp.float32)
+        scene_buf = self._build_scene_buffers(scene)
+        
+        aspect_ratio = cp.float32(self.width / self.height)
+        scale = cp.float32(math.tan(math.radians(fov_degrees) / 2.0))
+        cols, rows = cp.meshgrid(cp.arange(ss_width, dtype=cp.float32), cp.arange(ss_height, dtype=cp.float32))
 
-        for i, obj in enumerate(scene):
-            obj_mask = hit_mask & (closest_obj_indices == i)
-            if np.any(obj_mask):
-                # Symmetric extraction pass using the newly introduced batch endpoints
-                normals[obj_mask] = obj.get_normal_batch(hit_points[obj_mask])
+        print(f"Beginning CUDA-accelerated path tracing sequence ({spp} SPP)...")
+        start_time = time.perf_counter()
 
-        return normals
+        for sample in range(spp):
+            if sample % max(1, spp // 20) == 0 or sample == spp - 1:
+                elapsed = time.perf_counter() - start_time
+                eta = (elapsed / max(sample, 1)) * (spp - sample)
+                print(f"\r  [{100 * sample / spp:5.1f}%] Sample {sample}/{spp} | VRAM Tracked | ETA: {eta:.1f}s", end="", flush=True)
 
-    def _compute_shadows(
-        self, hit_points: np.ndarray, normals: np.ndarray, hit_mask: np.ndarray, light_position: np.ndarray, scene: List[Intersectable]
-    ) -> np.ndarray:
-        """Traces secondary shadow occlusion structures across the scene graph."""
-        H, W, _ = hit_points.shape
-        EPSILON = 1e-4
+            # Primary Ray Jitter (Fully calculated on GPU cores)
+            jitter_x = self.rng.random((ss_height, ss_width), dtype=cp.float32) - 0.5
+            jitter_y = self.rng.random((ss_height, ss_width), dtype=cp.float32) - 0.5
+            norm_x = -1.0 + ((cols + 0.5 + jitter_x) / ss_width) * 2.0
+            norm_y =  1.0 - ((rows + 0.5 + jitter_y) / ss_height) * 2.0
 
-        # Isolate active foreground regions before establishing secondary tracing structures
-        shadow_mask = np.zeros((H, W), dtype=bool)
+            dirs = cp.stack([norm_x * scale * aspect_ratio, norm_y * scale, cp.ones_like(norm_x)], axis=-1)
+            magnitudes = cp.sqrt(dirs[..., 0]**2 + dirs[..., 1]**2 + dirs[..., 2]**2)[..., cp.newaxis]
+            ray_directions = dirs / magnitudes
+            ray_origins = cp.broadcast_to(camera_origin, ray_directions.shape).copy()
 
-        if not np.any(hit_mask):
-            return shadow_mask
+            sample_color = cp.zeros((ss_height, ss_width, 3), dtype=cp.float32)
+            throughput = cp.ones((ss_height, ss_width, 3), dtype=cp.float32)
+            active_rays_mask = cp.ones((ss_height, ss_width), dtype=bool)
 
-        # Offset locations along normal lines to isolate primary objects from precision self-occlusion acne
-        shadow_origins = np.zeros_like(hit_points)
-        shadow_origins[hit_mask] = hit_points[hit_mask] + normals[hit_mask] * EPSILON
+            for depth in range(max_depth):
+                # .any() creates a tiny CPU synchronizer block, but it is necessary for loop safety
+                if not cp.any(active_rays_mask):
+                    break
 
-        shadow_dirs = np.zeros_like(hit_points)
-        shadow_dirs[hit_mask] = light_position - shadow_origins[hit_mask]
+                # --- Vectorized CUDA Batch Intersection Kernel ---
+                O = ray_origins[..., cp.newaxis, :]
+                D = ray_directions[..., cp.newaxis, :]
+                
+                # Spheres Math
+                of = O - scene_buf.centers
+                b = 2.0 * cp.sum(of * D, axis=-1)
+                c = cp.sum(of * of, axis=-1) - scene_buf.radii_sq
+                disc = b**2 - 4.0 * c
+                valid_sphere = (disc >= 0) & scene_buf.is_sphere
+                
+                sqrt_disc = cp.where(valid_sphere, cp.sqrt(cp.maximum(0, disc)), 0.0)
+                t1 = cp.where(valid_sphere, (-b - sqrt_disc) / 2.0, self.MAX_DIST)
+                t2 = cp.where(valid_sphere, (-b + sqrt_disc) / 2.0, self.MAX_DIST)
+                t_spheres = cp.minimum(cp.where(t1 > 1e-4, t1, self.MAX_DIST), cp.where(t2 > 1e-4, t2, self.MAX_DIST))
+                
+                # Planes Math
+                denom = cp.sum(D * scene_buf.plane_normals, axis=-1)
+                valid_plane = (cp.abs(denom) > 1e-6) & (~scene_buf.is_sphere)
+                safe_denom = cp.where(valid_plane, denom, 1.0)
+                num = cp.sum((scene_buf.centers - O) * scene_buf.plane_normals, axis=-1)
+                t_planes = cp.where(valid_plane & ((num / safe_denom) > 1e-4), num / safe_denom, self.MAX_DIST)
+                
+                # Selection
+                t_all = cp.where(scene_buf.is_sphere, t_spheres, t_planes)
+                closest_idx = cp.argmin(t_all, axis=-1)
+                closest_distances = cp.min(t_all, axis=-1)
+                
+                hit_mask = closest_distances < self.MAX_DIST
+                current_hit_mask = active_rays_mask & hit_mask
+                background_mask = active_rays_mask & (~hit_mask)
 
-        light_distances = np.zeros((H, W), dtype=np.float64)
-        light_distances[hit_mask] = np.linalg.norm(shadow_dirs[hit_mask], axis=-1)
+                # Background Evaluation
+                if cp.any(background_mask):
+                    sample_color[background_mask] += throughput[background_mask] * self.background_linear
+                    active_rays_mask[background_mask] = False
 
-        # Run secondary ray traces across every object in the scene
-        shadow_distances = np.stack([obj.intersect_batch(shadow_origins, shadow_dirs) for obj in scene], axis=0)
+                if not cp.any(current_hit_mask):
+                    break
 
-        # Evaluate occlusion status inside primary foreground masks
-        shadow_mask[hit_mask] = np.any(shadow_distances[:, hit_mask] < light_distances[hit_mask], axis=0)
+                # Geometry and Normal Extraction
+                hit_idx = closest_idx[current_hit_mask]
+                ray_origins[current_hit_mask] += ray_directions[current_hit_mask] * closest_distances[current_hit_mask, np.newaxis]
+                hit_points = ray_origins[current_hit_mask]
+                
+                is_sphere_hit = scene_buf.is_sphere[hit_idx][..., cp.newaxis]
+                sphere_normals = hit_points - scene_buf.centers[hit_idx]
+                s_mags = cp.sqrt(sphere_normals[..., 0]**2 + sphere_normals[..., 1]**2 + sphere_normals[..., 2]**2)[..., cp.newaxis]
+                sphere_normals = cp.where(s_mags > 1e-6, sphere_normals / s_mags, 0.0)
+                normals = cp.zeros_like(ray_directions)
+                normals[current_hit_mask] = cp.where(is_sphere_hit, sphere_normals, scene_buf.plane_normals[hit_idx])
 
-        return shadow_mask
+                # Batch VRAM Property Lookups
+                mat_emission = scene_buf.emission[hit_idx]
+                mat_is_emissive = scene_buf.is_emissive[hit_idx]
 
-    def _shade(
-        self,
-        hit_points: np.ndarray,
-        ray_directions: np.ndarray,
-        normals: np.ndarray,
-        shadow_mask: np.ndarray,
-        hit_mask: np.ndarray,
-        closest_obj_indices: np.ndarray,
-        light_position: np.ndarray,
-        scene: List[Intersectable],
-    ) -> np.ndarray:
-        """Executes parallel Phong illumination transformations, clamping, and gamma encoding."""
-        H, W, _ = hit_points.shape
-        AMBIENT_INTENSITY = 0.1
-        GAMMA_EXPONENT = 1.0 / 2.2
+                # Terminate emissive paths
+                sample_color[current_hit_mask] += throughput[current_hit_mask] * mat_emission
+                terminate_on_light = cp.zeros_like(active_rays_mask)
+                terminate_on_light[current_hit_mask] = mat_is_emissive
+                active_rays_mask &= ~terminate_on_light
+                
+                current_hit_mask = active_rays_mask & hit_mask
+                if not cp.any(current_hit_mask):
+                    break
 
-        # Initialize linear output color buffers
-        r_linear = np.zeros((H, W), dtype=np.float64)
-        g_linear = np.zeros((H, W), dtype=np.float64)
-        b_linear = np.zeros((H, W), dtype=np.float64)
+                # --- Material Routing Kernel ---
+                ray_dirs = ray_directions[current_hit_mask]
+                hit_norms = normals[current_hit_mask]
+                
+                dot_i_n = cp.sum(ray_dirs * hit_norms, axis=-1, keepdims=True)
+                reflected_dirs = ray_dirs - 2.0 * dot_i_n * hit_norms
+                
+                rand_vecs = self.rng.standard_normal(hit_norms.shape, dtype=cp.float32)
+                r_mags = cp.sqrt(rand_vecs[..., 0]**2 + rand_vecs[..., 1]**2 + rand_vecs[..., 2]**2)[..., cp.newaxis]
+                rand_vecs = cp.where(r_mags < 1e-12, 1.0, rand_vecs / r_mags)
+                dots = cp.sum(rand_vecs * hit_norms, axis=-1, keepdims=True)
+                diffuse_dirs = cp.where(dots < 0.0, -rand_vecs, rand_vecs)
 
-        # Separate unmasked calculations by iterating over the unique objects present in the scene
-        for i, obj in enumerate(scene):
-            obj_mask = hit_mask & (closest_obj_indices == i)
-            if not np.any(obj_mask):
-                continue
+                random_rolls = self.rng.random(ray_dirs.shape[0], dtype=cp.float32)[..., cp.newaxis]
+                
+                subset_idx = closest_idx[current_hit_mask]
+                sub_color = scene_buf.colors_linear[subset_idx]
+                sub_refl = scene_buf.reflectivity[subset_idx][..., cp.newaxis]
+                sub_diff = scene_buf.diffuse[subset_idx][..., np.newaxis]
 
-            # Linearize primitive source sRGB colors before illumination math operations occur
-            color_r = _to_linear_batch(obj.color[0])
-            color_g = _to_linear_batch(obj.color[1])
-            color_b = _to_linear_batch(obj.color[2])
-            mat = obj.material
+                use_mirror = random_rolls < sub_refl
+                ray_directions[current_hit_mask] = cp.where(use_mirror, reflected_dirs, diffuse_dirs)
 
-            # Define localized masks for shadowed vs illuminated regions
-            shd_submask = obj_mask & shadow_mask
-            lit_submask = obj_mask & ~shadow_mask
+                # Unbiased Probability Adjustment Weights
+                mirror_tp = sub_color / cp.clip(sub_refl, 1e-6, 1.0)
+                diffuse_tp = sub_color * sub_diff / cp.clip(1.0 - sub_refl, 1e-6, 1.0)
+                throughput[current_hit_mask] *= cp.where(use_mirror, mirror_tp, diffuse_tp)
 
-            # Path A: Shading for elements covered by shadowed regions
-            if np.any(shd_submask):
-                r_linear[shd_submask] = color_r * AMBIENT_INTENSITY * mat.diffuse
-                g_linear[shd_submask] = color_g * AMBIENT_INTENSITY * mat.diffuse
-                b_linear[shd_submask] = color_b * AMBIENT_INTENSITY * mat.diffuse
+                ray_origins[current_hit_mask] += normals[current_hit_mask] * 1e-4
 
-            # Path B: Full ambient, diffuse, and specular illumination tracking paths
-            if np.any(lit_submask):
-                to_light = light_position - hit_points[lit_submask]
-                light_dist = np.linalg.norm(to_light, axis=-1, keepdims=True)
-                # Eliminate possible zero division warnings inside inactive allocations
-                light_dist = np.where(light_dist == 0.0, 1.0, light_dist)
-                light_dir = to_light / light_dist
+                # Russian Roulette Path Termination
+                if depth >= 2:
+                    lum = 0.299 * throughput[..., 0] + 0.587 * throughput[..., 1] + 0.114 * throughput[..., 2]
+                    survival_prob = cp.clip(lum, 0.1, 0.95)
+                    rr_rolls = self.rng.random((ss_height, ss_width), dtype=cp.float32)
+                    
+                    terminate_mask = active_rays_mask & (rr_rolls > survival_prob)
+                    active_rays_mask &= ~terminate_mask
+                    throughput[active_rays_mask] /= survival_prob[active_rays_mask, cp.newaxis]
 
-                # Calculate diffuse factors using clean np.sum syntax
-                n_dot_l = np.sum(normals[lit_submask] * light_dir, axis=-1)
-                diffuse_intensity = np.maximum(AMBIENT_INTENSITY, n_dot_l) * mat.diffuse
+            sample_color = cp.where(cp.isfinite(sample_color), sample_color, 0.0)
+            total_accumulated_color += sample_color
 
-                # Calculate specular reflections
-                reflection_vec = (normals[lit_submask] * (2.0 * n_dot_l)[..., np.newaxis]) - light_dir
-                view_vec = -ray_directions[lit_submask]
-                r_dot_v = np.maximum(0.0, np.sum(reflection_vec * view_vec, axis=-1))
-                specular_intensity = (r_dot_v ** mat.shininess) * mat.specular
+        print("\nCUDA Trace loop complete.")
+        
+        # HDR Tone Mapping -> Gamma Correction Pipeline on GPU
+        averaged_linear = total_accumulated_color / cp.float32(spp)
+        tone_mapped = averaged_linear / (1.0 + averaged_linear)
 
-                # Accumulate distinct streams into global floating point linear arrays
-                r_linear[lit_submask] = (color_r * diffuse_intensity) + (255.0 * specular_intensity)
-                g_linear[lit_submask] = (color_g * diffuse_intensity) + (255.0 * specular_intensity)
-                b_linear[lit_submask] = (color_b * diffuse_intensity) + (255.0 * specular_intensity)
+        if aa_samples > 1:
+            reshaped = tone_mapped.reshape(self.height, aa_samples, self.width, aa_samples, 3)
+            tone_mapped = reshaped.mean(axis=(1, 3))
 
-        # Enforce boundary restrictions inside linear space fields prior to gamma transformation
-        r_linear = np.clip(r_linear, 0.0, 255.0)
-        g_linear = np.clip(g_linear, 0.0, 255.0)
-        b_linear = np.clip(b_linear, 0.0, 255.0)
-
-        # Execute display monitor sRGB gamma curve adjustments in parallel
-        r_out = (((r_linear / 255.0) ** GAMMA_EXPONENT) * 255.0).astype(np.int32)
-        g_out = (((g_linear / 255.0) ** GAMMA_EXPONENT) * 255.0).astype(np.int32)
-        b_out = (((b_linear / 255.0) ** GAMMA_EXPONENT) * 255.0).astype(np.int32)
-
-        return np.stack([r_out, g_out, b_out], axis=-1)
+        gamma_corrected = cp.power(cp.clip(tone_mapped, 0.0, 1.0), 1.0 / 2.2)
+        final_rgb = (gamma_corrected * 255.0).astype(cp.uint8)
+        
+        # Explicit transfer from GPU memory (CuPy Array) to Host memory (NumPy Array)
+        return cp.asnumpy(final_rgb)
